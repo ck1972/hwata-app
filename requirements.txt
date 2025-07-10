@@ -1,0 +1,8 @@
+streamlit
+torch
+torchvision
+rasterio
+geopandas
+numpy
+gdown
+
