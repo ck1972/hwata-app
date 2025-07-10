@@ -44,9 +44,7 @@ if uploaded_img:
     # Load model (download if missing)
     model_path = "deeplabv3_resnet101.pth"
     if not os.path.exists(model_path):
-        # FIXED LINK FORMAT: Use 'uc?id=' instead of 'file/d/.../view'
-        gdrive_id = "1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
-        url = f"https://drive.google.com/uc?id={gdrive_id}"
+        url = "https://drive.google.com/uc?id=1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
         gdown.download(url, model_path, quiet=False)
 
     model = deeplabv3_resnet101(weights=None, num_classes=2)
