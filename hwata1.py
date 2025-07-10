@@ -41,11 +41,15 @@ if uploaded_img:
         height, width = src.height, src.width
         raster_crs = src.crs
 
-    # Load model (download if missing)
+    # ✅ Load model (download from Google Drive if missing, with error handling)
     model_path = "deeplabv3_resnet101.pth"
     if not os.path.exists(model_path):
-        url = "https://drive.google.com/uc?id=1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
-        gdown.download(url, model_path, quiet=False)
+        try:
+            url = "https://drive.google.com/uc?id=1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
+            gdown.download(url, model_path, quiet=False)
+        except Exception as e:
+            st.error("❌ Failed to download the model. Please ensure the file is shared publicly on Google Drive.")
+            st.stop()
 
     model = deeplabv3_resnet101(weights=None, num_classes=2)
     model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
