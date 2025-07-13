@@ -7,62 +7,68 @@ Original file is located at
     https://colab.research.google.com/drive/1qIgb2CmPZ1REhRQa-ZyERt1oJbasfD96
 """
 
+# HWATA 1: Streamlit App for Regularized Building Footprint Extraction
+
 import streamlit as st
 import geopandas as gpd
 import rasterio
 import numpy as np
 import torch
 from rasterio import features
-from shapely.geometry import shape
 from tempfile import NamedTemporaryFile
 import os
 import gdown
+from shapely.geometry import shape
 from buildingregulariser import regularize_geodataframe
 import segmentation_models_pytorch as smp
+import folium
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="HWATA 1 – GeoAI Feature Extractor", layout="centered")
-st.title("HWATA v1.01 – Building Footprint Extractor with Regularization")
-st.markdown("Upload a 30cm RGB aerial image (GeoTIFF) to extract **regularized building polygons** as GeoJSON.")
+st.set_page_config(page_title="HWATA – GeoAI Feature Extractor", layout="centered")
+st.title("HWATA – Building Footprint Extractor (with Regularization)")
+st.markdown("Upload a 20cm satellite or aerial image (GeoTIFF), and HWATA will extract and regularize building footprints as GeoJSON.")
 
-# Upload input image
-uploaded_img = st.file_uploader("Upload 30 cm RGB Image (GeoTIFF)", type=["tif", "tiff"])
+# Upload image
+uploaded_img = st.file_uploader("Upload 20 cm Image (GeoTIFF)", type=["tif", "tiff"])
 
 if uploaded_img:
     with NamedTemporaryFile(delete=False, suffix=".tif") as tmp_img:
         tmp_img.write(uploaded_img.read())
         tmp_img_path = tmp_img.name
 
-    st.success("Image uploaded. Running model...")
+    st.success("Image uploaded successfully. Running prediction...")
 
     # Load image
     with rasterio.open(tmp_img_path) as src:
-        image = src.read([1, 2, 3]).astype(np.float32) / 255.0  # Normalize RGB
+        image = src.read([1, 2, 3])  # Use RGB bands
         transform = src.transform
         height, width = src.height, src.width
         raster_crs = src.crs
 
-    # Load U-Net model (download if missing)
+    image = image.astype(np.float32) / 255.0
+
+    # Load model
     model_path = "pretrained_unet_building_segmentation.pth"
     if not os.path.exists(model_path):
         try:
-            # ✅ Updated with correct Google Drive direct download format
-            file_id = "15ZDjkna10HX17nh-P9fxdxEShh_ZNWdc"
-            url = f"https://drive.google.com/uc?id={file_id}"
+            gdrive_id = "15ZDjkna10HX17nh-P9fxdxEShh_ZNWdc"
+            url = f"https://drive.google.com/uc?id={gdrive_id}"
             gdown.download(url, model_path, quiet=False)
         except Exception as e:
-            st.error("❌ Model download failed. Ensure the GDrive file is shared publicly.")
+            st.error("❌ Failed to download model. Make sure it is publicly accessible.")
             st.stop()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = smp.Unet(
-        encoder_name="resnet34",
-        encoder_weights="imagenet",
+        encoder_name='resnet34',
+        encoder_weights='imagenet',
         in_channels=3,
         classes=1,
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
+    # Predict
     patch_size = 256
     full_pred_mask = np.zeros((height, width), dtype=np.uint8)
 
@@ -77,9 +83,9 @@ if uploaded_img:
                 pred_patch = (output.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
                 full_pred_mask[i:i+patch_size, j:j+patch_size] = pred_patch
 
-    st.success("Model inference done. Converting to polygons...")
+    st.success("Prediction completed. Vectorizing and regularizing polygons...")
 
-    # Vectorize predicted mask
+    # Vectorize and regularize
     results = (
         {'properties': {'raster_val': v}, 'geometry': s}
         for s, v in features.shapes(full_pred_mask.astype(np.int16), transform=transform)
@@ -87,27 +93,41 @@ if uploaded_img:
     )
     gdf_pred = gpd.GeoDataFrame.from_features(list(results), crs=raster_crs)
 
-    # Filter small areas
+    # Filter small polygons
     gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
-    gdf_proj["area_m2"] = gdf_proj.geometry.area
-    gdf_filtered = gdf_proj[gdf_proj["area_m2"] >= 10].to_crs(raster_crs)
+    gdf_proj['area_m2'] = gdf_proj.geometry.area
+    gdf_filtered = gdf_proj[gdf_proj['area_m2'] >= 10].to_crs(raster_crs)
 
     # Regularize
     gdf_regularized = regularize_geodataframe(gdf_filtered)
 
-    # Export
-    output_geojson = "buildings_regularized.geojson"
+    # Save GeoJSON
+    output_geojson = "regularized_buildings.geojson"
     gdf_regularized.to_file(output_geojson, driver="GeoJSON")
 
-    st.success("✅ Building footprints extracted and regularized!")
+    st.success("✅ Building footprints extracted and regularized.")
+
+    # Interactive preview using Google Satellite + folium
+    st.markdown("### 🛰️ Preview on Google Satellite Imagery")
+    bounds = gdf_regularized.total_bounds
+    center_lat = (bounds[1] + bounds[3]) / 2
+    center_lon = (bounds[0] + bounds[2]) / 2
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=18, tiles=None)
+    folium.TileLayer(
+        tiles='https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+        attr='Google',
+        name='Google Satellite',
+        max_zoom=20,
+        subdomains=['mt0', 'mt1', 'mt2', 'mt3'],
+    ).add_to(m)
+    folium.GeoJson(gdf_regularized).add_to(m)
+    st_folium(m, width=700, height=500)
+
+    # Download
     with open(output_geojson, "rb") as f:
-        st.download_button("Download GeoJSON", data=f, file_name="buildings_regularized.geojson")
+        st.download_button("Download Regularized Buildings (GeoJSON)", data=f, file_name="regularized_buildings.geojson")
 
-    # Optional: show map (centroids only for speed)
-    gdf_centroids = gdf_regularized.copy()
-    gdf_centroids["lon"] = gdf_centroids.geometry.centroid.x
-    gdf_centroids["lat"] = gdf_centroids.geometry.centroid.y
-    st.map(gdf_centroids[["lat", "lon"]])
-
+    # Cleanup
     os.remove(tmp_img_path)
     os.remove(output_geojson)
