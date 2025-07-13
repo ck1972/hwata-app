@@ -41,14 +41,14 @@ if uploaded_img:
         height, width = src.height, src.width
         raster_crs = src.crs
 
-    # ✅ Load model (download from Google Drive if missing, with error handling)
+    # Load model (download if missing)
     model_path = "deeplabv3_resnet101.pth"
     if not os.path.exists(model_path):
         try:
             url = "https://drive.google.com/uc?id=1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
             gdown.download(url, model_path, quiet=False)
         except Exception as e:
-            st.error("❌ Failed to download the model. Please ensure the file is shared publicly on Google Drive.")
+            st.error("❌ Failed to download model. Please make sure the file is public on Google Drive.")
             st.stop()
 
     model = deeplabv3_resnet101(weights=None, num_classes=2)
@@ -82,11 +82,15 @@ if uploaded_img:
     geojson_save_path = "predicted_buildings.geojson"
     gdf_pred.to_file(geojson_save_path, driver="GeoJSON")
 
-    st.success("Building footprints extracted.")
+    st.success("✅ Building footprints extracted successfully.")
     with open(geojson_save_path, "rb") as f:
         st.download_button("Download GeoJSON", data=f, file_name="buildings.geojson")
 
-    st.map(gdf_pred)
+    # ✅ Show centroids on map to avoid Streamlit crash
+    gdf_centroids = gdf_pred.copy()
+    gdf_centroids["lon"] = gdf_centroids.geometry.centroid.x
+    gdf_centroids["lat"] = gdf_centroids.geometry.centroid.y
+    st.map(gdf_centroids[["lat", "lon"]])
 
     os.remove(tmp_img_path)
     os.remove(geojson_save_path)
