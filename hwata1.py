@@ -12,105 +12,103 @@ Original file is located at
 import streamlit as st
 import geopandas as gpd
 import rasterio
+from rasterio.plot import reshape_as_image
 import numpy as np
 import torch
-from rasterio import features
-from tempfile import NamedTemporaryFile
-import os
-import gdown
-import segmentation_models_pytorch as smp
-from shapely.geometry import shape
-from buildingregulariser import regularize_geodataframe
+import torchvision.transforms as T
+from segmentation_models_pytorch import Unet
 import folium
 from streamlit_folium import st_folium
+import os
+import tempfile
+from shapely.geometry import Polygon
+import zipfile
+from buildingregulariser import BuildingRegulariser
 
-st.set_page_config(page_title="HWATA 1 – GeoAI Feature Extractor", layout="centered")
-st.title("HWATA 1 – Building Footprint Extractor")
-st.markdown("Upload a 30cm satellite or aerial image (GeoTIFF), and HWATA 1 will extract regularized building footprints as GeoJSON.")
+# App title
+st.set_page_config(layout="wide")
+st.title("🏠 HWATA: Building Footprint Extraction App")
 
-# Upload model and image
-uploaded_img = st.file_uploader("Upload 30 cm Image (GeoTIFF)", type=["tif", "tiff"])
-
-if uploaded_img:
-    with NamedTemporaryFile(delete=False, suffix=".tif") as tmp_img:
-        tmp_img.write(uploaded_img.read())
-        tmp_img_path = tmp_img.name
-
-    st.success("Image uploaded successfully. Running prediction...")
-
-    # Load image
-    with rasterio.open(tmp_img_path) as src:
-        image = src.read([1, 2, 3])  # Use only RGB
-        transform = src.transform
-        height, width = src.height, src.width
-        raster_crs = src.crs
-
-    image = image.astype(np.float32) / 255.0
-
-    # Load model (download if missing)
-    model_path = "pretrained_unet_building_segmentation.pth"
-    if not os.path.exists(model_path):
-        gdrive_id = "15ZDjkna10HX17nh-P9fxdxEShh_ZNWdc"
-        url = f"https://drive.google.com/uc?id={gdrive_id}"
-        gdown.download(url, model_path, quiet=False)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = smp.Unet(
-        encoder_name="resnet34",
-        encoder_weights="imagenet",
-        in_channels=3,
-        classes=1
-    ).to(device)
-
-    model.load_state_dict(torch.load(model_path, map_location=device))
+# Load model
+@st.cache_resource
+def load_model():
+    model = Unet(encoder_name="resnet34", in_channels=3, classes=1)
+    model.load_state_dict(torch.load("pretrained_unet_building_segmentation.pth", map_location=torch.device('cpu')))
     model.eval()
+    return model
 
-    patch_size = 256
-    full_pred_mask = np.zeros((height, width), dtype=np.uint8)
+model = load_model()
 
-    with torch.no_grad():
-        for i in range(0, height - patch_size + 1, patch_size):
-            for j in range(0, width - patch_size + 1, patch_size):
-                patch = image[:, i:i+patch_size, j:j+patch_size]
-                if patch.shape[1:] != (patch_size, patch_size):
-                    continue
-                patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
-                output = torch.sigmoid(model(patch_tensor))
-                pred_patch = (output.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
-                full_pred_mask[i:i+patch_size, j:j+patch_size] = pred_patch
+# Upload zip of imagery files
+uploaded_file = st.file_uploader("📂 Upload a zipped 3-band GeoTIFF (e.g., RGB.tif inside a ZIP)", type=["zip"])
 
-    st.success("Prediction completed. Converting to GeoJSON...")
+if uploaded_file:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "input.zip")
+        with open(zip_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-    results = (
-        {'properties': {'raster_val': v}, 'geometry': s}
-        for s, v in features.shapes(full_pred_mask.astype(np.int16), transform=transform)
-        if v == 1
-    )
-    gdf_pred = gpd.GeoDataFrame.from_features(list(results), crs=raster_crs)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(tmpdir)
 
-    # Filter and regularize
-    gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
-    gdf_proj['area_m2'] = gdf_proj.geometry.area
-    gdf_filtered = gdf_proj[gdf_proj['area_m2'] >= 10].to_crs(raster_crs)
-    polygons = regularize_geodataframe(gdf_filtered)
+        # Find the first tif file inside the zip
+        tif_files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.endswith(".tif")]
+        if not tif_files:
+            st.error("No GeoTIFF (.tif) found in the uploaded ZIP.")
+        else:
+            tif_path = tif_files[0]
+            with rasterio.open(tif_path) as src:
+                image = src.read()
+                profile = src.profile
+                transform = src.transform
+                crs = src.crs
 
-    st.success("Building footprints extracted and regularized.")
+            # Prepare image for model
+            image_rgb = image[:3]  # Use first 3 bands (assumed RGB)
+            image_rgb = reshape_as_image(image_rgb)
+            transform_tensor = T.Compose([
+                T.ToPILImage(),
+                T.Resize((256, 256)),
+                T.ToTensor()
+            ])
+            input_tensor = transform_tensor(image_rgb).unsqueeze(0)
 
-    # Optional preview
-    if st.checkbox("Preview Building Footprints (GeoJSON overlay on Google imagery)"):
-        st.subheader("Interactive Preview")
-        bounds = polygons.total_bounds  # [minx, miny, maxx, maxy]
-        center_lat = (bounds[1] + bounds[3]) / 2
-        center_lon = (bounds[0] + bounds[2]) / 2
+            # Predict mask
+            with torch.no_grad():
+                pred_mask = model(input_tensor).squeeze().numpy()
+            pred_mask = (pred_mask > 0.5).astype(np.uint8)
 
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=18)
-        folium.TileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google Satellite', name='Google Satellite').add_to(m)
-        folium.GeoJson(polygons).add_to(m)
+            # Resize mask to original dimensions
+            pred_mask = np.array(T.Resize((image.shape[1], image.shape[2]))(T.ToPILImage()(pred_mask)))
 
-        st_data = st_folium(m, width=700, height=500)
+            # Vectorize mask to polygons
+            shapes = rasterio.features.shapes(pred_mask, transform=transform)
+            polygons = [Polygon(geom["coordinates"][0]) for geom, value in shapes if value == 1]
 
-    geojson_str = polygons.to_json()
-    st.download_button("\ud83d\udcc5 Download Building Footprints (GeoJSON)", geojson_str, file_name="building_footprints.geojson", mime="application/geo+json")
+            if not polygons:
+                st.warning("No building footprints detected.")
+            else:
+                gdf_pred = gpd.GeoDataFrame(geometry=polygons, crs=crs)
 
-    os.remove(tmp_img_path)
+                # Regularize using buildingregulariser
+                gdf_pred = BuildingRegulariser().regularise(gdf_pred)
+
+                # Reproject to EPSG:4326 for mapping
+                gdf_pred = gdf_pred.to_crs(epsg=4326)
+
+                # Show map
+                st.subheader("🌐 Preview Building Footprints")
+                center = [gdf_pred.geometry.centroid.y.mean(), gdf_pred.geometry.centroid.x.mean()]
+                m = folium.Map(location=center, zoom_start=18, tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", attr="Google Satellite")
+
+                folium.GeoJson(gdf_pred).add_to(m)
+                st_folium(m, height=500, width=800)
+
+                # Save and download
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp:
+                    gdf_pred.to_file(tmp.name, driver='GeoJSON')
+                    tmp_path = tmp.name
+
+                st.subheader("📥 Download Footprints")
+                with open(tmp_path, 'rb') as f:
+                    st.download_button("Download GeoJSON", f, "building_footprints.geojson", "application/geo+json")
