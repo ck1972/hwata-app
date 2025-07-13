@@ -7,55 +7,62 @@ Original file is located at
     https://colab.research.google.com/drive/1qIgb2CmPZ1REhRQa-ZyERt1oJbasfD96
 """
 
-# HWATA 1: Streamlit App for Building Footprint Extraction (Demo)
-
 import streamlit as st
 import geopandas as gpd
 import rasterio
 import numpy as np
 import torch
-from torchvision.models.segmentation import deeplabv3_resnet101
 from rasterio import features
+from shapely.geometry import shape
 from tempfile import NamedTemporaryFile
 import os
 import gdown
+from buildingregulariser import regularize_geodataframe
+import segmentation_models_pytorch as smp
 
 st.set_page_config(page_title="HWATA 1 – GeoAI Feature Extractor", layout="centered")
-st.title("HWATA 1 – Building Footprint Extractor")
-st.markdown("Upload a 30cm satellite or aerial image (GeoTIFF), and HWATA 1 will extract building footprints as GeoJSON.")
+st.title("HWATA v1.01 – Building Footprint Extractor with Regularization")
+st.markdown("Upload a 30cm RGB aerial image (GeoTIFF) to extract **regularized building polygons** as GeoJSON.")
 
-# Upload model and image
-uploaded_img = st.file_uploader("Upload 30 cm Image (GeoTIFF)", type=["tif", "tiff"])
+# Upload input image
+uploaded_img = st.file_uploader("Upload 30 cm RGB Image (GeoTIFF)", type=["tif", "tiff"])
 
 if uploaded_img:
     with NamedTemporaryFile(delete=False, suffix=".tif") as tmp_img:
         tmp_img.write(uploaded_img.read())
         tmp_img_path = tmp_img.name
 
-    st.success("Image uploaded successfully. Running prediction...")
+    st.success("Image uploaded. Running model...")
 
     # Load image
     with rasterio.open(tmp_img_path) as src:
-        image = src.read()
+        image = src.read([1, 2, 3]).astype(np.float32) / 255.0  # Normalize RGB
         transform = src.transform
         height, width = src.height, src.width
         raster_crs = src.crs
 
-    # Load model (download if missing)
-    model_path = "deeplabv3_resnet101.pth"
+    # Load U-Net model (download if missing)
+    model_path = "pretrained_unet_building_segmentation.pth"
     if not os.path.exists(model_path):
         try:
-            url = "https://drive.google.com/uc?id=1XxcKl_KH3IeBkj8svXulM0Nfhe7owxfr"
+            # ✅ Updated with correct Google Drive direct download format
+            file_id = "15ZDjkna10HX17nh-P9fxdxEShh_ZNWdc"
+            url = f"https://drive.google.com/uc?id={file_id}"
             gdown.download(url, model_path, quiet=False)
         except Exception as e:
-            st.error("❌ Failed to download model. Please make sure the file is public on Google Drive.")
+            st.error("❌ Model download failed. Ensure the GDrive file is shared publicly.")
             st.stop()
 
-    model = deeplabv3_resnet101(weights=None, num_classes=2)
-    model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=1,
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    # Patch inference
     patch_size = 256
     full_pred_mask = np.zeros((height, width), dtype=np.uint8)
 
@@ -63,34 +70,44 @@ if uploaded_img:
         for i in range(0, height - patch_size + 1, patch_size):
             for j in range(0, width - patch_size + 1, patch_size):
                 patch = image[:, i:i+patch_size, j:j+patch_size]
-                patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0)
-                output = model(patch_tensor)['out']
-                pred_patch = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+                if patch.shape[1:] != (patch_size, patch_size):
+                    continue
+                patch_tensor = torch.tensor(patch, dtype=torch.float32).unsqueeze(0).to(device)
+                output = torch.sigmoid(model(patch_tensor))
+                pred_patch = (output.squeeze().cpu().numpy() > 0.5).astype(np.uint8)
                 full_pred_mask[i:i+patch_size, j:j+patch_size] = pred_patch
 
-    st.success("Prediction completed. Converting to GeoJSON...")
+    st.success("Model inference done. Converting to polygons...")
 
+    # Vectorize predicted mask
     results = (
         {'properties': {'raster_val': v}, 'geometry': s}
         for s, v in features.shapes(full_pred_mask.astype(np.int16), transform=transform)
         if v == 1
     )
+    gdf_pred = gpd.GeoDataFrame.from_features(list(results), crs=raster_crs)
 
-    geoms = list(results)
-    gdf_pred = gpd.GeoDataFrame.from_features(geoms, crs=raster_crs)
+    # Filter small areas
+    gdf_proj = gdf_pred.to_crs(gdf_pred.estimate_utm_crs())
+    gdf_proj["area_m2"] = gdf_proj.geometry.area
+    gdf_filtered = gdf_proj[gdf_proj["area_m2"] >= 10].to_crs(raster_crs)
 
-    geojson_save_path = "predicted_buildings.geojson"
-    gdf_pred.to_file(geojson_save_path, driver="GeoJSON")
+    # Regularize
+    gdf_regularized = regularize_geodataframe(gdf_filtered)
 
-    st.success("✅ Building footprints extracted successfully.")
-    with open(geojson_save_path, "rb") as f:
-        st.download_button("Download GeoJSON", data=f, file_name="buildings.geojson")
+    # Export
+    output_geojson = "buildings_regularized.geojson"
+    gdf_regularized.to_file(output_geojson, driver="GeoJSON")
 
-    # ✅ Show centroids on map to avoid Streamlit crash
-    gdf_centroids = gdf_pred.copy()
+    st.success("✅ Building footprints extracted and regularized!")
+    with open(output_geojson, "rb") as f:
+        st.download_button("Download GeoJSON", data=f, file_name="buildings_regularized.geojson")
+
+    # Optional: show map (centroids only for speed)
+    gdf_centroids = gdf_regularized.copy()
     gdf_centroids["lon"] = gdf_centroids.geometry.centroid.x
     gdf_centroids["lat"] = gdf_centroids.geometry.centroid.y
     st.map(gdf_centroids[["lat", "lon"]])
 
     os.remove(tmp_img_path)
-    os.remove(geojson_save_path)
+    os.remove(output_geojson)
