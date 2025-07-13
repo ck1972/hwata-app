@@ -1,8 +1,10 @@
 streamlit
 torch
 torchvision
+segmentation-models-pytorch
 rasterio
 geopandas
-numpy
+shapely
 gdown
+buildingregulariser
 
