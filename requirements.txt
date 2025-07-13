@@ -1,12 +1,12 @@
 streamlit
+geopandas
+rasterio
+shapely
 torch
 torchvision
-numpy
-rasterio
-geopandas
-gdown
 segmentation-models-pytorch
-buildingregulariser
 folium
-streamlit_folium
+streamlit-folium
+buildingregulariser
+
 
