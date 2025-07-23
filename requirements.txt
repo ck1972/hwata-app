@@ -1,13 +1,16 @@
-streamlit
-geopandas
-rasterio
-shapely
-torch
-torchvision
-segmentation-models-pytorch
-folium
-streamlit-folium
-buildingregulariser
-gdown
+import streamlit as st
+import geopandas as gpd
+import rasterio
+import numpy as np
+import torch
+from rasterio import features
+from tempfile import NamedTemporaryFile
+import os
+import gdown
+import segmentation_models_pytorch as smp
+from shapely.geometry import shape
+from buildingregulariser import regularize_geodataframe
+import folium
+from streamlit_folium import st_folium
 
 
